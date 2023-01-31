@@ -45,6 +45,10 @@ function validDomain($domain_name, &$message = null)
 
 function validDomainWildcard($domain_name)
 {
+    // Skip this checks for the root zone `.`
+    if ($domain_name == '.') {
+        return true;
+    }
     // There has to be either no or at most one "*" at the beginning of a line
     $validChars = preg_match('/^((\\*\\.)?[_a-z\\d](-*[_a-z\\d])*)(\\.([_a-z\\d](-*[a-z\\d])*))*(\\.([_a-z\\d])*)*$/i', $domain_name);
     $lengthCheck = preg_match('/^.{1,253}$/', $domain_name);
@@ -105,6 +109,20 @@ function checkfile($filename)
     }
     // substitute dummy file
     return '/dev/null';
+}
+
+// Avoid browser caching old versions of a file, using the last modification time
+//   Receive the file URL (without "/admin/");
+//   Return the string containin URL + "?v=xxx", where xxx is the last modified time of the file.
+function fileversion($url)
+{
+    $filename = $_SERVER['DOCUMENT_ROOT'].'/admin/'.$url;
+    $ver = 0;  // Default
+    if (file_exists($filename)) {
+        $ver = filemtime($filename);
+    }
+
+    return $url.'?v='.$ver;
 }
 
 // Credit: http://php.net/manual/en/function.hash-equals.php#119576
@@ -192,6 +210,7 @@ function getCustomDNSEntries()
             $data = new \stdClass();
             $data->ip = $explodedLine[0];
             $data->domain = $explodedLine[1];
+            $data->domains = array_slice($explodedLine, 0, -1);
             $entries[] = $data;
         }
 
@@ -230,22 +249,39 @@ function addCustomDNSEntry($ip = '', $domain = '', $reload = '', $json = true)
             return returnError('Domain must be set', $json);
         }
 
-        if (!validDomain($domain)) {
-            return returnError('Domain must be valid', $json);
+        $num = 0;
+        // Check if each submitted domain is valid
+        $domains = array_map('trim', explode(',', $domain));
+        foreach ($domains as $d) {
+            if (!validDomain($d)) {
+                return returnError("Domain '{$d}' is not valid", $json);
+            }
+            ++$num;
         }
 
         // Only check for duplicates if adding new records from the web UI (not through Teleporter)
         if (isset($_REQUEST['ip']) || isset($_REQUEST['domain'])) {
             $existingEntries = getCustomDNSEntries();
             foreach ($existingEntries as $entry) {
-                if ($entry->domain == $domain && get_ip_type($entry->ip) == $ipType) {
-                    return returnError('This domain already has a custom DNS entry for an IPv'.$ipType, $json);
+                foreach ($domains as $d) {
+                    if ($entry->domain == $d && get_ip_type($entry->ip) == $ipType) {
+                        return returnError("The domain {$d} already has a custom DNS entry for an IPv".$ipType, $json);
+                    }
                 }
             }
         }
 
-        // Add record
-        pihole_execute('-a addcustomdns '.$ip.' '.$domain.' '.$reload);
+        // if $reload is not set and more then one domain is supplied, restart FTL only once after all entries were added
+        if (($num > 0) && (empty($reload))) {
+            $reload = 'false';
+        }
+        // Add records
+        foreach ($domains as $domain) {
+            pihole_execute('-a addcustomdns '.$ip.' '.$domain.' '.$reload);
+        }
+        if ($num > 0) {
+            pihole_execute('restartdns');
+        }
 
         return returnSuccess('', $json);
     } catch (\Exception $ex) {
@@ -388,12 +424,20 @@ function addCustomCNAMEEntry($domain = '', $target = '', $reload = '', $json = t
             return returnError('Target must be valid', $json);
         }
 
-        // Check if each submitted domain is valid
+        $num = 0;
         $domains = array_map('trim', explode(',', $domain));
         foreach ($domains as $d) {
+            // Check if each submitted domain is valid
             if (!validDomain($d)) {
                 return returnError("Domain '{$d}' is not valid", $json);
             }
+
+            // Check if each submitted domain is different than the target to avoid loops
+            if (strtolower($d) === strtolower($target)) {
+                return returnError('Domain and target cannot be the same', $json);
+            }
+
+            ++$num;
         }
 
         $existingEntries = getCustomCNAMEEntries();
@@ -407,7 +451,18 @@ function addCustomCNAMEEntry($domain = '', $target = '', $reload = '', $json = t
             }
         }
 
-        pihole_execute('-a addcustomcname '.$domain.' '.$target.' '.$reload);
+        // if $reload is not set and more then one domain is supplied, restart FTL only once after all entries were added
+        if (($num > 0) && (empty($reload))) {
+            $reload = 'false';
+        }
+        // add records
+        foreach ($domains as $d) {
+            pihole_execute('-a addcustomcname '.$d.' '.$target.' '.$reload);
+        }
+
+        if ($num > 0) {
+            pihole_execute('restartdns');
+        }
 
         return returnSuccess('', $json);
     } catch (\Exception $ex) {
@@ -585,7 +640,7 @@ function getGateway()
 }
 
 // Try to convert possible IDNA domain to Unicode
-function convertIDNAToUnicode($unicode)
+function convertIDNAToUnicode($IDNA)
 {
     if (extension_loaded('intl')) {
         // we try the UTS #46 standard first
@@ -597,32 +652,42 @@ function convertIDNAToUnicode($unicode)
             // to ensure sparkasse-gießen.de is not converted into
             // sparkass-giessen.de but into xn--sparkasse-gieen-2ib.de
             // as mandated by the UTS #46 standard
-            $unicode = idn_to_utf8($unicode, IDNA_NONTRANSITIONAL_TO_ASCII, INTL_IDNA_VARIANT_UTS46);
+            $unicode = idn_to_utf8($IDNA, IDNA_NONTRANSITIONAL_TO_ASCII, INTL_IDNA_VARIANT_UTS46);
         } elseif (defined('INTL_IDNA_VARIANT_2003')) {
             // If conversion failed, try with the (deprecated!) IDNA 2003 variant
             // We have to check for its existence as support of this variant is
             // scheduled for removal with PHP 8.0
             // see https://wiki.php.net/rfc/deprecate-and-remove-intl_idna_variant_2003
-            $unicode = idn_to_utf8($unicode, IDNA_DEFAULT, INTL_IDNA_VARIANT_2003);
+            $unicode = idn_to_utf8($IDNA, IDNA_DEFAULT, INTL_IDNA_VARIANT_2003);
         }
     }
 
-    return $unicode;
+    // if the conversion failed (e.g. domain to long) return the original domain
+    if ($unicode == false) {
+        return $IDNA;
+    } else {
+        return $unicode;
+    }
 }
 
 // Convert a given (unicode) domain to IDNA ASCII
-function convertUnicodeToIDNA($IDNA)
+function convertUnicodeToIDNA($unicode)
 {
     if (extension_loaded('intl')) {
         // Be prepared that this may fail and see our comments about convertIDNAToUnicode()
         if (defined('INTL_IDNA_VARIANT_UTS46')) {
-            $IDNA = idn_to_ascii($IDNA, IDNA_NONTRANSITIONAL_TO_ASCII, INTL_IDNA_VARIANT_UTS46);
+            $IDNA = idn_to_ascii($unicode, IDNA_NONTRANSITIONAL_TO_ASCII, INTL_IDNA_VARIANT_UTS46);
         } elseif (defined('INTL_IDNA_VARIANT_2003')) {
-            $IDNA = idn_to_ascii($IDNA, IDNA_DEFAULT, INTL_IDNA_VARIANT_2003);
+            $IDNA = idn_to_ascii($unicode, IDNA_DEFAULT, INTL_IDNA_VARIANT_2003);
         }
     }
 
-    return $IDNA;
+    // if the conversion failed (e.g. domain to long) return the original domain
+    if ($IDNA == false) {
+        return $unicode;
+    } else {
+        return $IDNA;
+    }
 }
 
 // Return PID of FTL (used in settings.php)
@@ -667,5 +732,5 @@ function start_php_session()
     // protection against cross-site request forgery attacks.
     // Direct support of Samesite has been added to PHP only in version 7.3
     // We manually set the cookie option ourselves to ensure backwards compatibility
-    header('Set-Cookie: PHPSESSID= '.session_id().'; path=/; HttpOnly; SameSite=Strict');
+    header('Set-Cookie: PHPSESSID='.session_id().'; path=/; HttpOnly; SameSite=Strict');
 }
